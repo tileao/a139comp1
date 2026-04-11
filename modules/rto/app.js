@@ -35,38 +35,6 @@ const BASE_PAGE_HEIGHT = 595;
 const BUILD_LABEL = 'BUILD V65 • IBF 7000 left OAT micro-drop';
 const BUILD_CACHE_KEY = 'v65';
 
-const externalParams = new URLSearchParams(window.location.search);
-
-function postResultToShell(payload) {
-  const message = { source: 'aw139-rto-module', ...payload };
-  try { window.parent?.postMessage(message, '*'); } catch (_) {}
-  try { window.dispatchEvent(new CustomEvent('aw139:rto-result', { detail: message })); } catch (_) {}
-}
-
-function applyExternalInputsFromQuery() {
-  const config = externalParams.get('config');
-  if (config && profiles[config]) configurationEl.value = config;
-
-  const setIfPresent = (el, keys) => {
-    for (const key of keys) {
-      const value = externalParams.get(key);
-      if (value != null && value !== '') {
-        el.value = value;
-        return;
-      }
-    }
-  };
-
-  setIfPresent(paEl, ['pa', 'pressureAltitude', 'pressureAltitudeFt']);
-  setIfPresent(oatEl, ['oat', 'oatC']);
-  setIfPresent(weightEl, ['weight', 'grossWeightKg', 'weightKg']);
-  setIfPresent(windEl, ['headwind', 'headwindKt', 'hw']);
-}
-
-function shouldAutorunFromQuery() {
-  return ['1', 'true', 'yes'].includes(String(externalParams.get('autorun') || '').toLowerCase());
-}
-
 const state = {
   engine: null,
   image: null,
@@ -828,24 +796,6 @@ function showSuccess(result) {
     `Base calculada ${fmt(o.baseDistanceM, 0)} m e correção total ${fmt(o.totalCorrectionM, 0)} m com ${windText}.`
   );
   updateResultCards(result);
-  postResultToShell({
-    type: 'rto-result',
-    ok: true,
-    requestId: externalParams.get('requestId') || null,
-    inputs: {
-      paFt: result.inputs.paFt,
-      oatC: result.inputs.oatC,
-      weightKg: result.inputs.weightKg,
-      headwindKt: result.inputs.headwindKt,
-      configuration: state.profileKey
-    },
-    result: {
-      finalDistanceM: o.finalDistanceM,
-      finalDistanceFt: o.finalDistanceFt,
-      baseDistanceM: o.baseDistanceM,
-      totalCorrectionM: o.totalCorrectionM
-    }
-  });
 
   const oatInterp = result.brackets.oatLow === result.brackets.oatHigh
     ? `OAT direta na linha ${result.brackets.oatLow} °C.`
@@ -873,7 +823,6 @@ function showSuccess(result) {
 function showReferencePending() {
   state.currentResult = null;
   setMetricsEmpty();
-  postResultToShell({ type: 'rto-result', ok: false, requestId: externalParams.get('requestId') || null, error: 'Perfil carregado apenas como referência visual; engine ainda pendente.' });
   const src = state.engine?.source || {};
   const confLabel = getSelectedConfigurationLabel();
   interpBox.innerHTML = `Visualização da Figure ${src.figure || '—'} pronta para auditoria. A engine deste perfil ainda está sendo reconstruída do zero.`;
@@ -885,7 +834,6 @@ function showReferencePending() {
 function showError(message, kind = 'warn') {
   setMetricsEmpty();
   interpBox.textContent = 'Sem cálculo válido para os dados informados.';
-  postResultToShell({ type: 'rto-result', ok: false, requestId: externalParams.get('requestId') || null, error: message });
   if (kind === 'warn') {
     setStatus('warn', 'FORA DA FAIXA', 'Sem cálculo', message, '');
   } else {
@@ -947,7 +895,6 @@ function loadDemo() {
 function clearResultsOnly() {
   state.currentResult = null;
   setMetricsEmpty();
-  postResultToShell({ type: 'rto-result', ok: false, requestId: externalParams.get('requestId') || null, error: 'Aguardando cálculo.' });
   interpBox.textContent = 'Sem cálculo ainda.';
   const figure = state.engine?.source?.figure || '—';
   if (isReferenceOnlyEngine()) {
@@ -1187,16 +1134,69 @@ async function init() {
     window.addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
   }
 
-  applyExternalInputsFromQuery();
-  await loadProfile(configurationEl.value || 'standard', { preserveInputs: false, autoRun: shouldAutorunFromQuery() });
-  if (shouldAutorunFromQuery()) {
-    setTimeout(() => {
-      runCalculation({ skipEnsureProfile: true });
-    }, 60);
-  }
+  await loadProfile(configurationEl.value || 'standard', { preserveInputs: false });
   applyAdaptiveLayout();
 }
 
 init().catch((error) => {
   showError(`Falha ao carregar a engine: ${error.message}`, 'err');
 });
+
+(function integrateWithCompanionShell() {
+  const query = new URLSearchParams(window.location.search);
+
+  function emit(type, payload) {
+    try {
+      if (window.parent && window.parent !== window) {
+        window.parent.postMessage({ type, payload }, '*');
+      }
+    } catch (_) {}
+  }
+
+  function applyQueryInputs() {
+    if (query.has('configuration') && configurationEl) {
+      configurationEl.value = query.get('configuration');
+    }
+    if (query.has('pa')) paEl.value = query.get('pa') || '';
+    if (query.has('oat')) oatEl.value = query.get('oat') || '';
+    if (query.has('weight')) weightEl.value = query.get('weight') || '';
+    if (query.has('wind')) windEl.value = query.get('wind') || '';
+  }
+
+  const originalShowSuccess = showSuccess;
+  showSuccess = function patchedShowSuccess(result) {
+    originalShowSuccess(result);
+    emit('aw139pc:rtoResult', {
+      distanceM: Number(result?.outputs?.finalDistanceM ?? 0),
+      baseDistanceM: Number(result?.outputs?.baseDistanceM ?? 0),
+      correctionM: Number(result?.outputs?.totalCorrectionM ?? 0),
+      configuration: state?.activeProfileKey || state?.profileKey || configurationEl?.value,
+      inputs: result?.inputs || null
+    });
+  };
+
+  const originalShowError = showError;
+  showError = function patchedShowError(message, kind = 'warn') {
+    originalShowError(message, kind);
+    emit('aw139pc:rtoError', { message, kind });
+  };
+
+  async function autorunFromQuery() {
+    applyQueryInputs();
+    const wantsAutorun = ['1', 'true', 'yes'].includes(String(query.get('autorun') || '').toLowerCase());
+    if (!wantsAutorun) return;
+    const requestedProfile = query.get('configuration') || configurationEl?.value || 'standard';
+    try {
+      await loadProfile(requestedProfile, { preserveInputs: true, autoRun: false, effectiveWeightKg: parseUnsignedField(weightEl) });
+      await runCalculation({ skipEnsureProfile: true });
+    } catch (error) {
+      emit('aw139pc:rtoError', { message: error?.message || 'Falha ao executar RTO automaticamente.', kind: 'err' });
+    }
+  }
+
+  window.addEventListener('load', () => {
+    window.setTimeout(() => {
+      autorunFromQuery().catch(() => {});
+    }, 120);
+  });
+})();

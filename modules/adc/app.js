@@ -812,26 +812,6 @@ const GEOM_KEY = 'aw139_adc_geometry_v49';
       document.getElementById('vizSubtitle').textContent = `${base.id} • ${runway.label} • ${chart.label} • toque na carta para abrir em tela cheia.`;
     }
 
-    function postAnalysisToShell() {
-      if (!state.analysis) return;
-      const message = {
-        source: 'aw139-adc-module',
-        type: 'adc-analysis',
-        requestId: new URLSearchParams(window.location.search).get('requestId') || null,
-        baseId: state.currentBaseId,
-        runwayId: state.currentRunwayId,
-        analysis: {
-          dep: state.analysis.dep,
-          rto: state.analysis.rto,
-          gateMetersFromRef: state.analysis.gateMetersFromRef,
-          declared: state.analysis.declared,
-          metrics: state.analysis.metrics
-        }
-      };
-      try { window.parent?.postMessage(message, '*'); } catch (e) {}
-      try { window.dispatchEvent(new CustomEvent('aw139:adc-analysis', { detail: message })); } catch (e) {}
-    }
-
     function analyze() {
       const token = document.getElementById('departureEndSelect').value;
       const parsed = parseDepartureToken(token);
@@ -849,7 +829,6 @@ const GEOM_KEY = 'aw139_adc_geometry_v49';
       renderResults();
       draw();
       saveUiState();
-      postAnalysisToShell();
     }
 
     function renderBaseInfo() {
@@ -1928,3 +1907,41 @@ const GEOM_KEY = 'aw139_adc_geometry_v49';
     if (persisted.rto) document.getElementById('rtoInput').value = persisted.rto;
     syncAdvancedPanel();
     if (!readExternalInbox()) analyze();
+
+(function integrateAdcWithCompanionShell() {
+  function emit(type, payload) {
+    try {
+      if (window.parent && window.parent !== window) {
+        window.parent.postMessage({ type, payload }, '*');
+      }
+    } catch (_) {}
+  }
+
+  function emitCurrentAnalysis() {
+    const analysis = state && state.analysis;
+    if (!analysis) return;
+    const fullRow = Array.isArray(analysis.rows)
+      ? analysis.rows.find((row) => row.id === 'FULL') || analysis.rows[0]
+      : null;
+    emit('aw139pc:adcResult', {
+      baseId: analysis.baseId,
+      runwayId: analysis.runwayId,
+      dep: analysis.dep,
+      rto: Number(analysis.rto || 0),
+      fullAvailableAsda: Number(fullRow?.availableAsda ?? analysis?.declared?.asda ?? 0),
+      go: Boolean(fullRow?.go ?? false)
+    });
+  }
+
+  const originalAnalyze = analyze;
+  analyze = function patchedAnalyze() {
+    originalAnalyze();
+    emitCurrentAnalysis();
+  };
+
+  window.addEventListener('load', () => {
+    window.setTimeout(() => {
+      emitCurrentAnalysis();
+    }, 180);
+  });
+})();
